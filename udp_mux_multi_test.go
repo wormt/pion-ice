@@ -313,7 +313,7 @@ func TestUDPMuxFromPortOptions_Apply(t *testing.T) {
 	})
 }
 
-func TestNewMultiUDPMuxFromPort_PortInUse_ListenErrorAndCleanup(t *testing.T) {
+func TestNewMultiUDPMuxFromPort_PortInUse_SkipsAddress(t *testing.T) {
 	pre, err := net.ListenUDP(udp, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 	defer func() {
@@ -325,9 +325,15 @@ func TestNewMultiUDPMuxFromPort_PortInUse_ListenErrorAndCleanup(t *testing.T) {
 	port := srvAddr.Port
 
 	multi, buildErr := NewMultiUDPMuxFromPort(port, UDPMuxFromPortWithLoopback(), UDPMuxFromPortWithNetworks(NetworkTypeUDP4))
+	require.NoError(t, buildErr)
+	require.NotNil(t, multi)
 
-	require.Nil(t, multi)
-	require.Error(t, buildErr)
+	for _, a := range multi.GetListenAddresses() {
+		addr, ok := a.(*net.UDPAddr)
+		require.True(t, ok)
+		require.NotEqual(t, "127.0.0.1", addr.IP.String())
+	}
+	require.NoError(t, multi.Close())
 }
 
 func TestNewMultiUDPMuxFromPort_Success_SetsBuffers(t *testing.T) {
@@ -341,49 +347,18 @@ func TestNewMultiUDPMuxFromPort_Success_SetsBuffers(t *testing.T) {
 	require.NoError(t, multi.Close())
 }
 
-func TestNewMultiUDPMuxFromPort_CleanupClosesAll(t *testing.T) {
-	stdNet, err := stdnet.NewNet()
+// When every address refuses the bind, the mux fails with the bind error.
+func TestMultiUDPMuxFromPortNoAddressBinds(t *testing.T) {
+	defer test.CheckRoutines(t)()
+
+	defer test.TimeOut(time.Second * 30).Stop()
+
+	taken, err := net.ListenUDP(udp4, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
+	defer func() { require.NoError(t, taken.Close()) }()
+	port := taken.LocalAddr().(*net.UDPAddr).Port
 
-	_, addrs, err := localInterfaces(stdNet, nil, nil, []NetworkType{NetworkTypeUDP4, NetworkTypeUDP6}, true)
-	require.NoError(t, err)
-	if len(addrs) < 2 {
-		t.Skip("need at least two local addresses to hit partial-success then failure")
-	}
-
-	second := addrs[1].addr
-	l2, err := stdNet.ListenUDP("udp", &net.UDPAddr{IP: second.AsSlice(), Port: 0, Zone: second.Zone()})
-	require.NoError(t, err)
-	defer func() {
-		_ = l2.Close()
-	}()
-
-	udpAddr2, ok := l2.LocalAddr().(*net.UDPAddr)
-	require.True(t, ok, "LocalAddr is not *net.UDPAddr")
-	picked := udpAddr2.Port
-
-	preBinds := []net.PacketConn{l2}
-	for i := 2; i < len(addrs); i++ {
-		a := addrs[i].addr
-		l, e := stdNet.ListenUDP("udp", &net.UDPAddr{IP: a.AsSlice(), Port: picked, Zone: a.Zone()})
-		if e == nil {
-			preBinds = append(preBinds, l)
-		}
-	}
-	t.Cleanup(func() {
-		for _, c := range preBinds {
-			_ = c.Close()
-		}
-	})
-
-	require.GreaterOrEqual(t, len(preBinds), 1, "need at least one prebound address after the first")
-
-	multi, buildErr := NewMultiUDPMuxFromPort(picked, UDPMuxFromPortWithNet(stdNet), UDPMuxFromPortWithNetworks(NetworkTypeUDP4, NetworkTypeUDP6), UDPMuxFromPortWithLoopback())
-	require.Nil(t, multi)
-	require.Error(t, buildErr)
-
-	first := addrs[0].addr
-	rebind, err := stdNet.ListenUDP("udp", &net.UDPAddr{IP: first.AsSlice(), Port: picked, Zone: first.Zone()})
-	require.NoError(t, err, "expected first address/port to be free after cleanup")
-	_ = rebind.Close()
+	onlyTaken := func(ip net.IP) bool { return ip.Equal(net.IPv4(127, 0, 0, 1)) }
+	_, err = NewMultiUDPMuxFromPort(port, UDPMuxFromPortWithLoopback(), UDPMuxFromPortWithIPFilter(onlyTaken))
+	require.Error(t, err)
 }

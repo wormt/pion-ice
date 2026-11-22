@@ -99,17 +99,27 @@ func NewMultiUDPMuxFromPort(port int, opts ...UDPMuxFromPortOption) (*MultiUDPMu
 		return nil, err
 	}
 
+	// An address can refuse the bind while every other address is fine: a
+	// tentative IPv6 address still in duplicate address detection, one removed
+	// since the enumeration, or the port taken on one interface. Skip it and
+	// fail only when no address bound at all.
+	var listenErr error
 	conns := make([]net.PacketConn, 0, len(addrs))
 	for _, addr := range addrs {
-		conn, listenErr := params.net.ListenUDP("udp", &net.UDPAddr{
+		conn, err := params.net.ListenUDP("udp", &net.UDPAddr{
 			IP:   addr.addr.AsSlice(),
 			Port: port,
 			Zone: addr.addr.Zone(),
 		})
-		if listenErr != nil {
-			err = listenErr
+		if err != nil {
+			if listenErr == nil {
+				listenErr = err
+			}
+			if params.logger != nil {
+				params.logger.Warnf("ice: UDPMuxFromPort can't listen on %s: %v", addr.addr.String(), err)
+			}
 
-			break
+			continue
 		}
 		if params.readBufferSize > 0 {
 			_ = conn.SetReadBuffer(params.readBufferSize)
@@ -120,12 +130,8 @@ func NewMultiUDPMuxFromPort(port int, opts ...UDPMuxFromPortOption) (*MultiUDPMu
 		conns = append(conns, conn)
 	}
 
-	if err != nil {
-		for _, conn := range conns {
-			_ = conn.Close()
-		}
-
-		return nil, err
+	if listenErr != nil && len(conns) == 0 {
+		return nil, listenErr
 	}
 
 	muxes := make([]UDPMux, 0, len(conns))
